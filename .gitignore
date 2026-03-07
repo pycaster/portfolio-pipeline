@@ -1,0 +1,15 @@
+bin/
+config.env
+.pipeline-state.json
+
+# Keep broker subdirectory stubs but ignore CSV files
+uploads/**/*.csv
+
+# Python cache
+scripts/__pycache__/
+*.pyc
+*.pyo
+
+# Go build artifacts
+*.test
+*.out
