@@ -7,7 +7,7 @@ export PATH := $(PATH):/usr/local/go/bin
 -include config.env
 export
 
-.PHONY: build build-email ingest-csv email-ingest migrate migrate-status status ingest-prices grafana-start grafana-stop gen-insights signals newsfeed-setup newsfeed-ingest newsfeed-outcomes newsfeed-ic newsfeed-alert newsfeed-mentions newsfeed-status check clean
+.PHONY: build build-email ingest-csv email-ingest migrate migrate-status status venv ingest-prices grafana-start grafana-stop gen-insights signals newsfeed-setup newsfeed-ingest newsfeed-outcomes newsfeed-ic newsfeed-alert newsfeed-mentions newsfeed-status trader trader-now trader-setup trader-backfill outcomes check clean
 
 build:
 	@mkdir -p bin
@@ -55,9 +55,15 @@ status:
 email-ingest: build-email
 	@$(EMAIL_BINARY)
 
-## Fetch current OHLCV prices for all held symbols via yfinance (ai-trader venv).
-## Writes into portfolio.prices with source='yfinance', superseding transaction-day prices.
-AITRADER_PYTHON := /home/vrmap/projects/ai-trader/.venv/bin/python
+PYTHON := .venv/bin/python
+
+## Set up Python venv and install dependencies (one-time).
+venv:
+	python3 -m venv .venv
+	.venv/bin/pip install -r requirements.txt
+
+## Fetch current OHLCV prices for all held symbols via yfinance.
+AITRADER_PYTHON := $(PYTHON)
 ingest-prices:
 	@$(AITRADER_PYTHON) scripts/ingest_prices.py
 
@@ -112,6 +118,33 @@ newsfeed-mentions:
 ## Show article counts, IC table, pipeline status.
 newsfeed-status:
 	@$(AITRADER_PYTHON) scripts/newsfeed.py --status
+
+## Install Python deps for trader daemon (one-time setup).
+trader-setup:
+	$(AITRADER_PYTHON) -m pip install apscheduler pandas_market_calendars
+
+## Run trader daemon (blocking — runs on market schedule).
+trader:
+	@$(AITRADER_PYTHON) scripts/trader.py
+
+## Run post-close pipeline immediately (prices → signals → strategy → alert).
+trader-now:
+	@$(AITRADER_PYTHON) scripts/trader.py --now
+
+## Backfill pipeline for a date range. START required, END optional (defaults to START).
+## Example: make trader-backfill START=2026-02-24 END=2026-03-07
+trader-backfill:
+	@$(AITRADER_PYTHON) scripts/trader.py --backfill $(START) $(END)
+
+## Backfill last 60 days of 1h intraday signals (indicators_1h + strategy_1h).
+trader-backfill-intraday:
+	@$(AITRADER_PYTHON) scripts/trader.py --backfill-intraday
+
+## Compute forward return outcomes for all strategy decisions.
+## Pass SYMBOL or FROM to filter: make outcomes FROM=2026-02-24
+## Pass SYMBOL=PLTR to limit to one symbol: make outcomes SYMBOL=PLTR
+outcomes:
+	@$(PYTHON) scripts/compute_outcomes.py $(if $(SYMBOL),--symbol $(SYMBOL),) $(if $(FROM),--from $(FROM),)
 
 ## Compile check and go vet.
 check:

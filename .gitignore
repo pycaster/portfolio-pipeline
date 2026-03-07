@@ -1,4 +1,5 @@
 bin/
+.venv/
 config.env
 .pipeline-state.json
 

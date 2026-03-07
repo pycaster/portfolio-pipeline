@@ -1,0 +1,14 @@
+# Core signal pipeline
+yfinance
+pandas
+numpy
+
+# Trader daemon scheduler + market calendar
+apscheduler
+pandas_market_calendars
+
+# Newsfeed FinBERT fallback (only used if LocalAI classifier is unavailable)
+# Heavy deps (~2GB). Install separately if needed:
+#   pip install transformers torch --index-url https://download.pytorch.org/whl/cpu
+# transformers
+# torch

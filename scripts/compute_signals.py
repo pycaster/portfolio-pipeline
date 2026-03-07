@@ -247,13 +247,22 @@ def _safe(val) -> float | None:
 # Per-symbol compute
 # ---------------------------------------------------------------------------
 
-def compute_for_symbol(symbol: str, yf_ticker: str | None = None) -> list[dict]:
-    """Compute signals for `symbol` (stored name). `yf_ticker` is the yfinance lookup
-    key — defaults to `symbol`, but crypto needs `{symbol}-USD`."""
+def compute_for_symbol(symbol: str, yf_ticker: str | None = None,
+                       end_date: date | None = None,
+                       start_date: date | None = None) -> list[dict]:
+    """Compute signals for `symbol`.
+
+    end_date   — last bar to include (defaults to today). Pass a past date for backtesting.
+    start_date — earliest bar to include in results (signals before this are still computed
+                 for warmup but not returned). Defaults to end_date - LOOKBACK_DAYS.
+    """
     if yf_ticker is None:
         yf_ticker = symbol
-    end   = date.today()
-    start = end - timedelta(days=LOOKBACK_DAYS)
+    end   = end_date or date.today()
+    # When backfilling, anchor warmup to start_date so indicators exist from day 1.
+    # Otherwise anchor to end_date (live/recent mode).
+    fetch_from = (start_date - timedelta(days=LOOKBACK_DAYS)) if start_date else (end - timedelta(days=LOOKBACK_DAYS))
+    start = fetch_from
 
     try:
         df = yf.download(yf_ticker, start=str(start), end=str(end),
@@ -276,15 +285,37 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None) -> list[dict]:
         print(f"  WARN  {symbol}: only {len(df)} bars — need {SENKOU_B_PERIOD + DISPLACEMENT} for full Ichimoku")
         return []
 
-    close = df["close"]
-    high  = df["high"]
-    low   = df["low"]
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    volume = df["volume"]
 
     rsi  = compute_rsi(close)
     ichi = compute_ichimoku(high, low, close)
     div  = compute_divergence(close, rsi)
 
-    DIV_SCORE = {'bullish_div': 2, 'hidden_bull': 2, 'bearish_div': -2, 'hidden_bear': -1}
+    # Volume signals
+    vol_avg    = volume.rolling(20).mean()
+    vol_ratio  = (volume / vol_avg.replace(0, np.nan)).fillna(0)
+
+    # OBV: cumulative sum of signed volume
+    direction = np.sign(close.diff().fillna(0))
+    obv       = (direction * volume).cumsum()
+    # OBV trend: slope over last 10 bars (positive=rising, negative=falling)
+    obv_slope = obv.diff(10)
+
+    def _vol_signal(i: int) -> str:
+        ratio = float(vol_ratio.iloc[i])
+        if ratio < 1.3:
+            return "neutral"
+        price_up = float(close.iloc[i]) > float(close.iloc[i - 1]) if i > 0 else False
+        return "accumulation" if price_up else "distribution"
+
+    def _obv_trend(i: int) -> str:
+        slope = float(obv_slope.iloc[i])
+        if abs(slope) < 1:
+            return "flat"
+        return "rising" if slope > 0 else "falling"
 
     results = []
     prev_row = None
@@ -344,8 +375,10 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None) -> list[dict]:
         }
         score, _ = score_signal(pd.Series(current), pd.Series(prev_row) if prev_row else None)
 
+        # Divergences are stored as context labels — they do NOT contribute to signal_score.
+        # Ichimoku drives the score; RSI zone and divergence type are used as guards in strategy.
         r_div       = str(div.iloc[i])
-        total_score = score + DIV_SCORE.get(r_div, 0)
+        total_score = score
         if total_score >= 4:
             signal = "bullish"
         elif total_score <= -4:
@@ -369,6 +402,175 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None) -> list[dict]:
             "rsi_divergence": r_div,
             "signal":         signal,
             "signal_score":   total_score,
+            "vol_ratio":      round(float(vol_ratio.iloc[i]), 4),
+            "obv_trend":      _obv_trend(i),
+            "vol_signal":     _vol_signal(i),
+        })
+        prev_row = current
+
+    # Filter to requested date range if start_date given
+    if start_date is not None:
+        results = [r for r in results if r["date"] >= str(start_date)]
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Intraday (1h) per-symbol compute
+# ---------------------------------------------------------------------------
+
+def compute_for_symbol_1h(symbol: str, yf_ticker: str | None = None) -> list[dict]:
+    """Compute Ichimoku + RSI + volume signals on 1h bars.
+
+    Fetches the last 60 calendar days of 1h OHLCV from yfinance.
+    Returns records with 'datetime' (UTC ISO string, no tz suffix) instead of 'date'.
+    All computation logic is identical to the daily version — only the timeframe differs.
+    """
+    if yf_ticker is None:
+        yf_ticker = symbol
+
+    MIN_BARS = SENKOU_B_PERIOD + DISPLACEMENT  # 78 bars minimum for full Ichimoku warmup
+
+    try:
+        df = yf.download(yf_ticker, period="60d", interval="1h",
+                         progress=False, auto_adjust=True)
+    except Exception as e:
+        print(f"  ERR   {symbol}: yfinance 1h download failed — {e}", file=sys.stderr)
+        return []
+
+    if df.empty:
+        print(f"  WARN  {yf_ticker}: no 1h price data returned")
+        return []
+
+    if hasattr(df.columns, "get_level_values"):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [c.lower() for c in df.columns]
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+
+    if len(df) < MIN_BARS:
+        print(f"  WARN  {symbol}: only {len(df)} 1h bars — need {MIN_BARS} for full Ichimoku")
+        return []
+
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    volume = df["volume"]
+
+    rsi  = compute_rsi(close)
+    ichi = compute_ichimoku(high, low, close)
+    div  = compute_divergence(close, rsi)
+
+    vol_avg   = volume.rolling(20).mean()
+    vol_ratio = (volume / vol_avg.replace(0, np.nan)).fillna(0)
+
+    direction = np.sign(close.diff().fillna(0))
+    obv       = (direction * volume).cumsum()
+    obv_slope = obv.diff(10)
+
+    def _vol_signal(i: int) -> str:
+        ratio = float(vol_ratio.iloc[i])
+        if ratio < 1.3:
+            return "neutral"
+        price_up = float(close.iloc[i]) > float(close.iloc[i - 1]) if i > 0 else False
+        return "accumulation" if price_up else "distribution"
+
+    def _obv_trend(i: int) -> str:
+        slope = float(obv_slope.iloc[i])
+        if abs(slope) < 1:
+            return "flat"
+        return "rising" if slope > 0 else "falling"
+
+    results  = []
+    prev_row = None
+
+    for i, (ts, _) in enumerate(df.iterrows()):
+        r_close  = close.iloc[i]
+        r_rsi    = _safe(rsi.iloc[i])
+        r_tenkan = _safe(ichi["tenkan"].iloc[i])
+        r_kijun  = _safe(ichi["kijun"].iloc[i])
+        r_sa     = _safe(ichi["senkou_a"].iloc[i])
+        r_sb     = _safe(ichi["senkou_b"].iloc[i])
+
+        if any(v is None for v in [r_tenkan, r_kijun, r_sa, r_sb]):
+            prev_row = None
+            continue
+
+        rsi_zone = "neutral"
+        if r_rsi is not None:
+            if r_rsi > 70:
+                rsi_zone = "overbought"
+            elif r_rsi < 30:
+                rsi_zone = "oversold"
+
+        cloud_top    = max(r_sa, r_sb)
+        cloud_bottom = min(r_sa, r_sb)
+        cloud_color  = "green" if r_sa >= r_sb else "red"
+
+        if r_close > cloud_top:
+            price_vs_cloud = "above"
+        elif r_close < cloud_bottom:
+            price_vs_cloud = "below"
+        else:
+            price_vs_cloud = "inside"
+
+        tk_cross = "neutral"
+        if prev_row is not None and prev_row["tenkan"] is not None and prev_row["kijun"] is not None:
+            pt = float(prev_row["tenkan"])
+            pk = float(prev_row["kijun"])
+            if (pt <= pk) and (r_tenkan > r_kijun):
+                tk_cross = "bullish_cross"
+            elif (pt >= pk) and (r_tenkan < r_kijun):
+                tk_cross = "bearish_cross"
+            elif r_tenkan > r_kijun:
+                tk_cross = "bullish"
+            elif r_tenkan < r_kijun:
+                tk_cross = "bearish"
+
+        current = {
+            "close":    r_close,
+            "tenkan":   r_tenkan,
+            "kijun":    r_kijun,
+            "senkou_a": r_sa,
+            "senkou_b": r_sb,
+            "rsi_14":   r_rsi,
+        }
+        score, _ = score_signal(pd.Series(current), pd.Series(prev_row) if prev_row else None)
+
+        r_div       = str(div.iloc[i])
+        total_score = score
+        if total_score >= 4:
+            signal = "bullish"
+        elif total_score <= -4:
+            signal = "bearish"
+        else:
+            signal = "mixed"
+
+        # yfinance 1h returns tz-aware UTC timestamps — strip tz for ClickHouse DateTime
+        try:
+            dt_utc = ts.tz_convert("UTC").tz_localize(None)
+        except Exception:
+            dt_utc = ts.replace(tzinfo=None)
+        dt_str = dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+        results.append({
+            "symbol":         symbol,
+            "datetime":       dt_str,
+            "close":          round(float(r_close), 6),
+            "rsi_14":         r_rsi if r_rsi is not None else 0.0,
+            "rsi_zone":       rsi_zone,
+            "tenkan":         r_tenkan,
+            "kijun":          r_kijun,
+            "senkou_a":       r_sa,
+            "senkou_b":       r_sb,
+            "cloud_color":    cloud_color,
+            "price_vs_cloud": price_vs_cloud,
+            "tk_cross":       tk_cross,
+            "rsi_divergence": r_div,
+            "signal":         signal,
+            "signal_score":   total_score,
+            "vol_ratio":      round(float(vol_ratio.iloc[i]), 4),
+            "obv_trend":      _obv_trend(i),
+            "vol_signal":     _vol_signal(i),
         })
         prev_row = current
 
@@ -390,7 +592,11 @@ def main():
         "SELECT DISTINCT symbol FROM portfolio.crypto_positions")
     crypto_symbols = {r[0] for r in crypto_rows}
 
-    # Symbols from args, or auto-read from held positions
+    # Watchlist: extra symbols to always track (even without a position)
+    watchlist_env = os.environ.get("WATCHLIST", "").strip()
+    watchlist = {s.strip().upper() for s in watchlist_env.split(",") if s.strip()} if watchlist_env else set()
+
+    # Symbols from args, or auto-read from held positions + watchlist
     symbols = sys.argv[1:]
     if not symbols:
         stock_rows  = ch_query(ch_http, auth,
@@ -401,7 +607,11 @@ def main():
             {r[0] for r in stock_rows}
             | {r[0] for r in option_rows}
             | crypto_symbols
+            | watchlist
         )
+    elif watchlist:
+        # CLI args given — merge watchlist in too
+        symbols = sorted(set(symbols) | watchlist)
 
     if not symbols:
         print("  no symbols — pass symbols as args or hold a position")
@@ -415,6 +625,7 @@ def main():
         "tenkan", "kijun", "senkou_a", "senkou_b",
         "cloud_color", "price_vs_cloud", "tk_cross",
         "rsi_divergence", "signal", "signal_score",
+        "vol_ratio", "obv_trend", "vol_signal",
     ]
 
     total_rows = 0
