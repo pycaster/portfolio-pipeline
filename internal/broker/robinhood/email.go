@@ -41,7 +41,8 @@ var (
 	emailStockRe = regexp.MustCompile(`(?i)order to (buy|sell)\s+([\d,]+)\s+shares? of\s+([A-Z]+)[^.]*?was executed at an average price of \$([\d,]+(?:\.\d+)?)\s+on (\w+\s+\d{1,2},\s+\d{4})`)
 
 	// Crypto fill: "market order to buy 100 SOL was filled for $8,804.91"
-	emailCryptoRe = regexp.MustCompile(`(?i)(market|limit) order to (buy|sell)\s+([\d,]+)\s+([A-Z]+)\s+was filled for \$([\d,]+(?:\.\d+)?)`)
+	// Qty uses [\d,]+(?:\.\d+)? to handle fractional amounts like 0.00031 BTC.
+	emailCryptoRe = regexp.MustCompile(`(?i)(market|limit) order to (buy|sell)\s+([\d,]+(?:\.\d+)?)\s+([A-Z]+)\s+was filled for \$([\d,]+(?:\.\d+)?)`)
 
 	// Legacy structured format (pre-2026 Robinhood emails).
 	emailSymbolRe   = regexp.MustCompile(`(?i)<b>Symbol</b>:\s*([A-Z0-9./]+)`)
@@ -93,7 +94,8 @@ func isNonTradeEmail(body string) bool {
 	if title == "" {
 		return true
 	}
-	skipWords := []string{"cancel", "replac", "statement", "confirmation", "available", "futures", "details", "dividend", "upcoming", "going"}
+	// "details" intentionally excluded — Robinhood Crypto fills are titled "Your BTC order details"
+	skipWords := []string{"cancel", "replac", "statement", "confirmation", "available", "futures", "dividend", "upcoming", "going"}
 	for _, word := range skipWords {
 		if strings.Contains(title, word) {
 			return true

@@ -22,7 +22,6 @@ Usage:
 import os
 import sys
 import json
-import smtplib
 import logging
 import argparse
 import subprocess
@@ -30,7 +29,6 @@ import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import date, timedelta
-from email.mime.text import MIMEText
 
 try:
     import pandas_market_calendars as mcal
@@ -66,13 +64,11 @@ CH_USER  = os.environ.get("CH_USER",  "default")
 CH_PASS  = os.environ.get("CH_PASS",  "")
 CH_AUTH  = f"user={urllib.parse.quote(CH_USER)}&password={urllib.parse.quote(CH_PASS)}"
 
-WATCHLIST_ENV = os.environ.get("WATCHLIST", "").strip()
-WATCHLIST     = {s.strip().upper() for s in WATCHLIST_ENV.split(",") if s.strip()} if WATCHLIST_ENV else set()
+WATCHLIST_ENV     = os.environ.get("WATCHLIST", "").strip()
+WATCHLIST         = {s.strip().upper() for s in WATCHLIST_ENV.split(",") if s.strip()} if WATCHLIST_ENV else set()
 
-EMAIL_SMTP = os.environ.get("EMAIL_SMTP_ADDR", "smtp.gmail.com:587")
-EMAIL_FROM = os.environ.get("EMAIL_USER", "")
-EMAIL_PASS = os.environ.get("MAIL_APP_PASSWORD", "")
-EMAIL_TO   = os.environ.get("ALERT_EMAIL", EMAIL_FROM)
+SLACK_WEBHOOK_URL        = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_INGEST_WEBHOOK_URL = os.environ.get("SLACK_INGEST_WEBHOOK_URL", "")
 
 # ---------------------------------------------------------------------------
 # ClickHouse helpers
@@ -279,43 +275,72 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
 
     return transitions
 
-# ---------------------------------------------------------------------------
-# Alerting
-# ---------------------------------------------------------------------------
+def _slack_post(webhook_url: str, text: str):
+    """POST a plain-text message to a Slack incoming webhook."""
+    body = json.dumps({"text": text}).encode()
+    req  = urllib.request.Request(
+        webhook_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+
 
 def send_alert(transitions: list[dict]):
-    if not transitions or not EMAIL_FROM or not EMAIL_PASS:
-        if transitions:
-            log.warning("alert: EMAIL_USER / MAIL_APP_PASSWORD not set — skipping email")
+    """Post BUY/EXIT transition alerts to Slack via incoming webhook.
+
+    Called immediately after strategy evaluation whenever a transition is detected —
+    both intraday (job_intraday) and post-close (job_close).
+    """
+    if not transitions:
+        return
+    if not SLACK_WEBHOOK_URL:
+        log.warning("send_alert: SLACK_WEBHOOK_URL not set — %d transition(s) suppressed", len(transitions))
         return
 
-    lines = []
     for t in transitions:
-        label = t["decision"]
-        lines.append(
-            f"[{label}] {t['symbol']}  ${t['close']:.2f}  score={t['score']:+d}  ({t['date']})\n"
-            f"  Why:   {', '.join(t['reasons'])}\n"
-            f"  RSI:   {t['rsi_zone']}  div={t['rsi_div'] or 'none'}\n"
-            f"  Prev:  {t['prev'] or 'none'}\n"
+        symbol   = t["symbol"]
+        decision = t["decision"]
+        score    = t["score"]
+        reasons  = t["reasons"]
+        close    = t["close"]
+        date_str = t.get("date", "")
+
+        emoji = "🚨" if decision == "EXIT" else "📈"
+        reasons_str = " | ".join(reasons[:4]) if reasons else "—"
+
+        # For EXIT, show how much is held so the urgency is clear
+        held_note = ""
+        if decision == "EXIT":
+            try:
+                rows = ch_query(
+                    f"SELECT quantity FROM portfolio.stock_positions "
+                    f"WHERE symbol = '{symbol}' LIMIT 1"
+                )
+                if rows:
+                    held_note = f" | Held: {rows[0][0]} shares"
+                else:
+                    rows = ch_query(
+                        f"SELECT quantity FROM portfolio.option_positions "
+                        f"WHERE symbol = '{symbol}' AND option_expiry >= today() LIMIT 1"
+                    )
+                    if rows:
+                        held_note = f" | Held: {rows[0][0]} contracts"
+            except Exception:
+                pass
+
+        msg = (
+            f"{emoji} *{decision} — {symbol}* @ ${close:.2f}{held_note}\n"
+            f"Score: {score:+d} | {reasons_str}\n"
+            f"_{date_str}_"
         )
-
-    subject = " | ".join(f"[{t['decision']}] {t['symbol']}" for t in transitions)
-    body    = "\n".join(lines)
-
-    msg            = MIMEText(body)
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = EMAIL_TO
-    msg["Subject"] = subject
-
-    host, port = EMAIL_SMTP.rsplit(":", 1)
-    try:
-        with smtplib.SMTP(host, int(port), timeout=15) as s:
-            s.starttls()
-            s.login(EMAIL_FROM, EMAIL_PASS)
-            s.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-        log.info("alert: sent — %s", subject)
-    except Exception as e:
-        log.error("alert: email failed — %s", e)
+        try:
+            _slack_post(SLACK_WEBHOOK_URL, msg)
+            log.info("send_alert: posted %s %s to Slack", decision, symbol)
+        except Exception as e:
+            log.error("send_alert: Slack post failed — %s", e)
 
 # ---------------------------------------------------------------------------
 # Price + signal ingestion (date-aware)
@@ -587,12 +612,31 @@ def job_email_ingest():
     log.info("=== job_email_ingest start ===")
     try:
         result = subprocess.run([binary], capture_output=True, text=True, timeout=120)
-        if result.stdout.strip():
-            log.info("email-ingest: %s", result.stdout.strip())
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        output = "\n".join(filter(None, [stdout, stderr]))
+        log.info("email-ingest exit=%d", result.returncode)
+        if stdout:
+            log.info("email-ingest stdout: %s", stdout)
+        if stderr:
+            log.info("email-ingest stderr: %s", stderr)
         if result.returncode != 0:
-            log.error("email-ingest exited %d: %s", result.returncode, result.stderr.strip())
+            log.error("email-ingest failed (exit %d)", result.returncode)
+        elif "inserted" in output:
+            # New transaction landed — fetch prices immediately so the dashboard is current.
+            log.info("email-ingest: new transaction(s) inserted — refreshing prices")
+            try:
+                _ingest_prices(all_symbols())
+            except Exception as e:
+                log.error("email-ingest: price refresh failed — %s", e)
+            if SLACK_INGEST_WEBHOOK_URL:
+                try:
+                    _slack_post(SLACK_INGEST_WEBHOOK_URL,
+                                f"📥 Robinhood order ingested\n_{output}_")
+                except Exception as e:
+                    log.error("job_email_ingest: Slack post failed — %s", e)
     except Exception as e:
-        log.error("job_email_ingest: %s", e)
+        log.error("job_email_ingest exception: %s", e)
     log.info("=== job_email_ingest done ===")
 
 
@@ -731,8 +775,8 @@ def job_close(target_date: date | None = None, alert: bool = True):
         transitions = []
 
     if alert:
-        log.info("step 4/4: alert (%d transitions)", len(transitions or []))
         send_alert(transitions or [])
+        log.info("step 4/4: transitions=%d", len(transitions or []))
     else:
         log.info("step 4/4: alert suppressed (backfill)")
         if transitions:
@@ -838,7 +882,13 @@ def main():
         job_backfill(start, end)
         return
 
-    # Daemon mode
+    # Daemon mode — run time-sensitive jobs immediately on startup so a deploy
+    # doesn't cause a missed window while waiting for the first scheduled fire.
+    log.info("startup: running initial jobs before scheduler")
+    job_email_ingest()
+    job_news()
+    job_intraday()
+
     scheduler = BlockingScheduler(timezone="America/New_York")
 
     scheduler.add_job(job_news, CronTrigger(

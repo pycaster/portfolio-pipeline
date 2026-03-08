@@ -78,7 +78,11 @@ func main() {
 			continue
 		}
 		if txn == nil {
-			slog.Debug("skipped non-trade email", "uid", msg.UID)
+			slog.Warn("skipped as non-trade email", "uid", msg.UID)
+			dumpFile := fmt.Sprintf("/tmp/robinhood-email-%d.txt", msg.UID)
+			if werr := os.WriteFile(dumpFile, []byte(msg.Body), 0600); werr == nil {
+				slog.Info("body dumped for inspection", "file", dumpFile)
+			}
 			continue
 		}
 		slog.Info("parsed", "uid", msg.UID,
