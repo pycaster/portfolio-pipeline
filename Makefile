@@ -7,7 +7,9 @@ export PATH := $(PATH):/usr/local/go/bin
 -include config.env
 export
 
-.PHONY: build build-email ingest-csv email-ingest migrate migrate-status status venv ingest-prices grafana-start grafana-stop gen-insights signals newsfeed-setup newsfeed-ingest newsfeed-outcomes newsfeed-ic newsfeed-alert newsfeed-mentions newsfeed-status trader trader-now trader-setup trader-backfill outcomes check clean
+TRADER_COMPOSE := /home/vrmap/projects/dockage/stacks/trader/docker-compose.yaml
+
+.PHONY: build build-email ingest-csv email-ingest migrate migrate-status status venv ingest-prices grafana-start grafana-stop gen-insights signals newsfeed-setup newsfeed-ingest newsfeed-outcomes newsfeed-ic newsfeed-alert newsfeed-mentions newsfeed-status trader trader-deploy trader-now trader-setup trader-backfill outcomes check clean
 
 build:
 	@mkdir -p bin
@@ -139,6 +141,12 @@ trader-backfill:
 ## Backfill last 60 days of 1h intraday signals (indicators_1h + strategy_1h).
 trader-backfill-intraday:
 	@$(AITRADER_PYTHON) scripts/trader.py --backfill-intraday
+
+## Build binaries and redeploy the trader Docker container.
+## Run this after any code change or first-time setup.
+trader-deploy: build-email
+	docker compose -f $(TRADER_COMPOSE) up -d --force-recreate
+	@echo "  trader redeployed — logs: docker logs trader -f"
 
 ## Compute forward return outcomes for all strategy decisions.
 ## Pass SYMBOL or FROM to filter: make outcomes FROM=2026-02-24

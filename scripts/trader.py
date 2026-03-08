@@ -3,9 +3,11 @@
 trader.py — Portfolio signal daemon.
 
 Runs on a market-aware schedule (NYSE calendar):
-  09:00 ET        →  ingest news + mentions (sentiment signals)
-  09:30–15:30 ET  →  intraday Ichimoku/RSI signals on 1h bars (every :30)
-  16:30 ET        →  ingest prices → compute signals → evaluate strategy → alert
+  every 30min ET    →  ingest news + mentions (sentiment signals, daily)
+  09:30–15:30 ET    →  intraday Ichimoku/RSI signals on 1h bars (every :30)
+  every 30min ET    →  poll Gmail for Robinhood order emails (daily)
+  16:30 ET          →  ingest prices → compute signals → evaluate strategy → alert
+  Monday 07:00 ET   →  generate LLM trading insights via Claude API
 
 Strategy evaluation combines Ichimoku + RSI + divergence + volume signals
 into BUY / WATCH / HOLD / EXIT decisions, alerting only on transitions.
@@ -23,6 +25,7 @@ import json
 import smtplib
 import logging
 import argparse
+import subprocess
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -40,6 +43,9 @@ except ImportError as e:
 
 # Ensure scripts/ dir is importable
 sys.path.insert(0, os.path.dirname(__file__))
+REPO_DIR    = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_venv_py    = os.path.join(REPO_DIR, ".venv", "bin", "python")
+VENV_PYTHON = _venv_py if os.path.exists(_venv_py) else sys.executable
 import compute_signals
 import compute_outcomes
 import newsfeed
@@ -572,6 +578,39 @@ def _compute_signals(symbols: list[str], end_date: date | None = None,
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 
+def job_email_ingest():
+    """Poll Gmail for unseen Robinhood order emails and ingest into ClickHouse."""
+    binary = os.path.join(REPO_DIR, "bin", "email-ingest")
+    if not os.path.exists(binary):
+        log.error("job_email_ingest: binary not found at %s — run 'make build-email'", binary)
+        return
+    log.info("=== job_email_ingest start ===")
+    try:
+        result = subprocess.run([binary], capture_output=True, text=True, timeout=120)
+        if result.stdout.strip():
+            log.info("email-ingest: %s", result.stdout.strip())
+        if result.returncode != 0:
+            log.error("email-ingest exited %d: %s", result.returncode, result.stderr.strip())
+    except Exception as e:
+        log.error("job_email_ingest: %s", e)
+    log.info("=== job_email_ingest done ===")
+
+
+def job_gen_insights():
+    """Generate LLM trading insights for the current month via Claude API."""
+    script = os.path.join(REPO_DIR, "scripts", "gen_insights.py")
+    log.info("=== job_gen_insights start ===")
+    try:
+        result = subprocess.run([VENV_PYTHON, script], capture_output=True, text=True, timeout=180)
+        if result.stdout.strip():
+            log.info("gen_insights: %s", result.stdout.strip())
+        if result.returncode != 0:
+            log.error("gen_insights exited %d: %s", result.returncode, result.stderr.strip())
+    except Exception as e:
+        log.error("job_gen_insights: %s", e)
+    log.info("=== job_gen_insights done ===")
+
+
 def job_backfill_intraday():
     """Populate signals.indicators_1h and signals.strategy_1h for the last 60 days.
 
@@ -803,7 +842,7 @@ def main():
     scheduler = BlockingScheduler(timezone="America/New_York")
 
     scheduler.add_job(job_news, CronTrigger(
-        day_of_week="mon-fri", hour=9, minute=0,
+        minute="*/30",
         timezone="America/New_York",
     ), id="job_news", name="News ingest")
 
@@ -819,7 +858,20 @@ def main():
         timezone="America/New_York",
     ), id="job_close", name="Post-close pipeline")
 
-    log.info("trader daemon starting — job_news@09:00, job_intraday@:30(09:30-15:30), job_close@16:30 ET")
+    # Email ingest: poll Gmail every 30min, every day
+    scheduler.add_job(job_email_ingest, CronTrigger(
+        minute="*/30",
+        timezone="America/New_York",
+    ), id="job_email_ingest", name="Email ingest")
+
+    # Weekly LLM insights: Monday morning before market open
+    scheduler.add_job(job_gen_insights, CronTrigger(
+        day_of_week="mon", hour=7, minute=0,
+        timezone="America/New_York",
+    ), id="job_gen_insights", name="Generate insights")
+
+    log.info("trader daemon starting — job_news@*/30, job_intraday@:30(09:30-15:30), "
+             "job_close@16:30, job_email_ingest@*/30, job_gen_insights@Mon07:00 ET")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
