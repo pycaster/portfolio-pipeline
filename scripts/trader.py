@@ -69,6 +69,8 @@ WATCHLIST         = {s.strip().upper() for s in WATCHLIST_ENV.split(",") if s.st
 
 SLACK_WEBHOOK_URL        = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_INGEST_WEBHOOK_URL = os.environ.get("SLACK_INGEST_WEBHOOK_URL", "")
+SLACK_CRYPTO_WEBHOOK_URL  = os.environ.get("SLACK_CRYPTO_WEBHOOK_URL", "")
+SLACK_OPTIONS_WEBHOOK_URL = os.environ.get("SLACK_OPTIONS_WEBHOOK_URL", "")
 
 # ---------------------------------------------------------------------------
 # ClickHouse helpers
@@ -159,7 +161,8 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
     rows = ch_query(f"""
         SELECT
             symbol, signal_score, rsi_zone, price_vs_cloud, tk_cross,
-            rsi_divergence, vol_ratio, obv_trend, vol_signal, close
+            rsi_divergence, vol_ratio, obv_trend, vol_signal, close,
+            kijun, cloud_color
         FROM signals.indicators FINAL
         WHERE symbol IN ({sym_list}) AND date = '{today_s}'
     """)
@@ -185,11 +188,15 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
 
     for r in rows:
         (symbol, signal_score, rsi_zone, price_vs_cloud,
-         tk_cross, rsi_div, vol_ratio, obv_trend, vol_signal, close) = r
+         tk_cross, rsi_div, vol_ratio, obv_trend, vol_signal, close,
+         kijun, cloud_color) = r
 
-        signal_score = int(signal_score)
-        vol_ratio    = float(vol_ratio)
-        reasons      = []
+        signal_score  = int(signal_score)
+        vol_ratio     = float(vol_ratio)
+        close_f       = float(close)
+        kijun_f       = float(kijun)
+        prev_decision = prev_map.get(symbol, "")
+        reasons       = []
 
         if price_vs_cloud == "above":
             reasons.append("above_cloud")
@@ -214,6 +221,32 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
 
         total = signal_score + VOL_SCORE.get(vol_signal, 0)
 
+        # Cloud retest: price pulled back into/below cloud but Kijun held and
+        # TK structure remains bullish in a green cloud — accumulation zone.
+        cloud_retest = (
+            price_vs_cloud in ("below", "inside")
+            and cloud_color == "green"
+            and tk_cross in ("bullish", "bullish_cross")
+            and close_f >= kijun_f
+            and total >= 1
+        )
+
+        # Cloud reclaim: price jumped back above cloud after a retest WATCH —
+        # lower BUY threshold since Kijun support was already confirmed.
+        cloud_reclaim = (
+            price_vs_cloud == "above"
+            and prev_decision == "WATCH"
+            and tk_cross in ("bullish", "bullish_cross")
+            and vol_signal == "accumulation"
+            and total >= 3
+            and rsi_zone != "overbought"
+        )
+
+        if cloud_retest:
+            reasons.append("cloud_retest")
+        if cloud_reclaim:
+            reasons.append("cloud_reclaim")
+
         # Ichimoku score drives EXIT/BUY thresholds.
         # RSI zone and divergence type are context guards — they don't affect the score,
         # but they gate conditions: oversold = don't exit (bottom risk), overbought+bearish_div = exit.
@@ -229,22 +262,23 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
             and rsi_zone != "oversold"  # never exit when already oversold — highest bounce risk
         )
         buy_cond = (
-            total >= 5
-            and vol_ratio > 1.2
-            and rsi_zone != "overbought"
-            and price_vs_cloud == "above"
+            (
+                total >= 5
+                and vol_ratio > 1.2
+                and rsi_zone != "overbought"
+                and price_vs_cloud == "above"
+            )
+            or cloud_reclaim  # reclaiming cloud after confirmed Kijun support
         )
 
         if exit_cond:
             decision = "EXIT"
         elif buy_cond:
             decision = "BUY"
-        elif total >= 4 and price_vs_cloud == "above":  # score 4+ above cloud = genuine momentum
+        elif (total >= 4 and price_vs_cloud == "above") or cloud_retest:
             decision = "WATCH"
         else:
             decision = "HOLD"
-
-        prev_decision = prev_map.get(symbol, "")
 
         strategy_rows.append([symbol, today_s, decision, total, reasons, prev_decision])
 
@@ -288,16 +322,21 @@ def _slack_post(webhook_url: str, text: str):
         resp.read()
 
 
-def send_alert(transitions: list[dict]):
+def send_alert(transitions: list[dict], webhook_url: str = ""):
     """Post BUY/EXIT transition alerts to Slack via incoming webhook.
 
-    Called immediately after strategy evaluation whenever a transition is detected —
-    both intraday (job_intraday) and post-close (job_close).
+    webhook_url selects the channel:
+      SLACK_WEBHOOK_URL         — daily/close signals (stocks, all)
+      SLACK_CRYPTO_WEBHOOK_URL  — 1h crypto signals
+      SLACK_OPTIONS_WEBHOOK_URL — 1h signals for symbols with open options
+
+    Defaults to SLACK_WEBHOOK_URL if not specified.
     """
     if not transitions:
         return
-    if not SLACK_WEBHOOK_URL:
-        log.warning("send_alert: SLACK_WEBHOOK_URL not set — %d transition(s) suppressed", len(transitions))
+    url = webhook_url or SLACK_WEBHOOK_URL
+    if not url:
+        log.warning("send_alert: no webhook URL — %d transition(s) suppressed", len(transitions))
         return
 
     for t in transitions:
@@ -308,8 +347,14 @@ def send_alert(transitions: list[dict]):
         close    = t["close"]
         date_str = t.get("date", "")
 
-        emoji = "🚨" if decision == "EXIT" else "📈"
+        emoji = {"EXIT": "🚨", "BUY": "📈", "SCALP_LONG_CAUTION": "⚡↑", "SCALP_SHORT_CAUTION": "⚡↓"}.get(decision, "📈")
         reasons_str = " | ".join(reasons[:4]) if reasons else "—"
+
+        # For scalp alerts, include Kijun target prominently
+        scalp_note = ""
+        if decision in ("SCALP_LONG_CAUTION", "SCALP_SHORT_CAUTION") and t.get("kijun"):
+            direction = "↑" if decision == "SCALP_LONG_CAUTION" else "↓"
+            scalp_note = f" | Target {direction} ${t['kijun']:.2f} (Kijun) | RSI {t.get('rsi', 0):.0f}"
 
         # For EXIT, show how much is held so the urgency is clear
         held_note = ""
@@ -332,21 +377,31 @@ def send_alert(transitions: list[dict]):
                 pass
 
         msg = (
-            f"{emoji} *{decision} — {symbol}* @ ${close:.2f}{held_note}\n"
+            f"{emoji} *{decision} — {symbol}* @ ${close:.2f}{held_note}{scalp_note}\n"
             f"Score: {score:+d} | {reasons_str}\n"
             f"_{date_str}_"
         )
         try:
-            _slack_post(SLACK_WEBHOOK_URL, msg)
+            _slack_post(url, msg)
             log.info("send_alert: posted %s %s to Slack", decision, symbol)
         except Exception as e:
             log.error("send_alert: Slack post failed — %s", e)
+
+
+def _option_symbols() -> set[str]:
+    """Return symbols with currently open option positions."""
+    rows = ch_query(
+        "SELECT DISTINCT symbol FROM portfolio.option_positions "
+        "WHERE option_expiry >= today()"
+    )
+    return {r[0] for r in rows}
 
 # ---------------------------------------------------------------------------
 # Price + signal ingestion (date-aware)
 # ---------------------------------------------------------------------------
 
-def _ingest_prices(symbols: list[str], end_date: date | None = None):
+def _ingest_prices(symbols: list[str], end_date: date | None = None,
+                   start_date: date | None = None):
     """Fetch OHLCV up to end_date (default: today) and write to portfolio.prices."""
     import yfinance as yf
 
@@ -354,7 +409,7 @@ def _ingest_prices(symbols: list[str], end_date: date | None = None):
     crypto_symbols = {r[0] for r in crypto_rows}
 
     end   = end_date or date.today()
-    start = end - timedelta(days=365)
+    start = start_date or (end - timedelta(days=365))
 
     rows = []
     for symbol in symbols:
@@ -450,14 +505,15 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
               SELECT symbol, max(datetime)
               FROM signals.indicators_1h FINAL
               WHERE symbol IN ({sym_list})
-                AND toDate(datetime, 'America/New_York') = today()
+                AND toDate(datetime, 'America/New_York') = toDate(now(), 'America/New_York')
               GROUP BY symbol
           )"""
 
     rows = ch_query(f"""
         SELECT
             symbol, signal_score, rsi_zone, price_vs_cloud, tk_cross,
-            rsi_divergence, vol_ratio, obv_trend, vol_signal, close, datetime
+            rsi_divergence, vol_ratio, obv_trend, vol_signal, close, datetime,
+            kijun, cloud_color, tenkan, rsi_14
         FROM signals.indicators_1h FINAL
         WHERE symbol IN ({sym_list})
           AND {indicator_filter}
@@ -466,6 +522,26 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
     if not rows:
         log.warning("evaluate_strategy_intraday: no 1h indicator rows for today")
         return []
+
+    # Kijun flatness: range of Kijun over last 3 bars as % of Kijun.
+    # Flat Kijun (< 0.3%) is a price magnet — key filter for scalp setups.
+    if target_dt:
+        kijun_flat_filter = f"datetime <= '{target_dt}'"
+    else:
+        kijun_flat_filter = f"toDate(datetime, 'America/New_York') = toDate(now(), 'America/New_York')"
+    kijun_flat_rows = ch_query(f"""
+        SELECT symbol,
+               (max(kijun) - min(kijun)) / nullIf(avg(kijun), 0) AS kijun_range_pct
+        FROM (
+            SELECT symbol, kijun,
+                   row_number() OVER (PARTITION BY symbol ORDER BY datetime DESC) AS rn
+            FROM signals.indicators_1h FINAL
+            WHERE symbol IN ({sym_list}) AND {kijun_flat_filter}
+        )
+        WHERE rn <= 3
+        GROUP BY symbol
+    """)
+    kijun_flat_map = {r[0]: float(r[1] or 1.0) for r in kijun_flat_rows}
 
     # Previous decision per symbol (most recent row before now)
     prev_rows = ch_query(f"""
@@ -477,16 +553,41 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
     """)
     prev_map = {r[0]: r[1] for r in prev_rows}
 
+    # Previous bar's RSI zone — needed for scalp detection (RSI bottoms in bar N,
+    # tenkan reclaim happens in bar N+1 when RSI has already recovered to neutral).
+    if target_dt:
+        prev_rsi_filter = f"datetime < '{target_dt}'"
+    else:
+        prev_rsi_filter = f"toDate(datetime, 'America/New_York') = toDate(now(), 'America/New_York')"
+    prev_rsi_rows = ch_query(f"""
+        SELECT symbol, rsi_zone
+        FROM signals.indicators_1h FINAL
+        WHERE symbol IN ({sym_list}) AND {prev_rsi_filter}
+        ORDER BY symbol ASC, datetime DESC
+        LIMIT 1 BY symbol
+    """)
+    prev_rsi_map = {r[0]: r[1] for r in prev_rsi_rows}
+
     strategy_rows = []
     transitions   = []
 
     for r in rows:
         (symbol, signal_score, rsi_zone, price_vs_cloud,
-         tk_cross, rsi_div, vol_ratio, obv_trend, vol_signal, close, dt_str) = r
+         tk_cross, rsi_div, vol_ratio, obv_trend, vol_signal, close, dt_str,
+         kijun, cloud_color, tenkan, rsi_14) = r
 
-        signal_score = int(signal_score)
-        vol_ratio    = float(vol_ratio)
-        reasons      = []
+        signal_score   = int(signal_score)
+        vol_ratio      = float(vol_ratio)
+        close_f        = float(close)
+        kijun_f        = float(kijun)
+        tenkan_f       = float(tenkan) if tenkan else close_f
+        rsi_f          = float(rsi_14) if rsi_14 else 50.0
+        prev_decision  = prev_map.get(symbol, "")
+        prev_rsi_zone  = prev_rsi_map.get(symbol, "")
+        rsi_was_oversold   = rsi_zone == "oversold" or prev_rsi_zone == "oversold"
+        rsi_was_overbought = rsi_zone == "overbought" or prev_rsi_zone == "overbought"
+        kijun_flat    = kijun_flat_map.get(symbol, 1.0) < 0.008
+        reasons       = []
 
         if price_vs_cloud == "above":
             reasons.append("above_cloud")
@@ -511,6 +612,63 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
 
         total = signal_score + VOL_SCORE.get(vol_signal, 0)
 
+        # Cloud retest: price pulled back into/below cloud but Kijun held and
+        # TK structure remains bullish in a green cloud — accumulation zone.
+        cloud_retest = (
+            price_vs_cloud in ("below", "inside")
+            and cloud_color == "green"
+            and tk_cross in ("bullish", "bullish_cross")
+            and close_f >= kijun_f
+            and total >= 1
+        )
+
+        # Cloud reclaim: price jumped back above cloud after a retest WATCH —
+        # lower BUY threshold since Kijun support was already confirmed.
+        cloud_reclaim = (
+            price_vs_cloud == "above"
+            and prev_decision == "WATCH"
+            and tk_cross in ("bullish", "bullish_cross")
+            and vol_signal == "accumulation"
+            and total >= 3
+            and rsi_zone != "overbought"
+        )
+
+        if cloud_retest:
+            reasons.append("cloud_retest")
+        if cloud_reclaim:
+            reasons.append("cloud_reclaim")
+
+        # Scalp long: oversold RSI bounce back above Tenkan, flat Kijun as magnet above.
+        # Fires when current bar OR previous bar was oversold — catches the common case
+        # where RSI bottoms in bar N but tenkan reclaim happens in bar N+1.
+        # Counter-trend — only valid below cloud. Divergence confirmation left to trader.
+        kijun_proximity = abs(kijun_f - close_f) / close_f < 0.015  # Kijun within 1.5%
+        scalp_long = (
+            rsi_was_oversold
+            and price_vs_cloud == "below"
+            and close_f >= tenkan_f
+            and kijun_f > close_f        # Kijun is above — acts as magnet
+            and kijun_proximity
+            and kijun_flat
+        )
+
+        # Scalp short: overbought RSI fade below Tenkan, flat Kijun as magnet below.
+        # Same prev-bar logic applied symmetrically.
+        # Counter-trend — only valid above cloud.
+        scalp_short = (
+            rsi_was_overbought
+            and price_vs_cloud == "above"
+            and close_f <= tenkan_f
+            and kijun_f < close_f        # Kijun is below — acts as magnet
+            and kijun_proximity
+            and kijun_flat
+        )
+
+        if scalp_long:
+            reasons.append(f"scalp_long (RSI {rsi_f:.0f}, kijun target {kijun_f:.2f})")
+        if scalp_short:
+            reasons.append(f"scalp_short (RSI {rsi_f:.0f}, kijun target {kijun_f:.2f})")
+
         # Same strategy logic as daily — Ichimoku drives score, RSI is context guard
         exit_cond = (
             (
@@ -521,25 +679,33 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
             and rsi_zone != "oversold"
         )
         buy_cond = (
-            total >= 5
-            and vol_ratio > 1.2
-            and rsi_zone != "overbought"
-            and price_vs_cloud == "above"
+            (
+                total >= 5
+                and vol_ratio > 1.2
+                and rsi_zone != "overbought"
+                and price_vs_cloud == "above"
+            )
+            or cloud_reclaim  # reclaiming cloud after confirmed Kijun support
         )
 
-        if exit_cond:
+        # Scalp signals take priority over EXIT/HOLD — they are explicitly counter-trend.
+        # An EXIT tells you the trend is down; SCALP_LONG_CAUTION tells you there's a short-term
+        # bounce setup within that downtrend. Both can be true simultaneously.
+        if scalp_long:
+            decision = "SCALP_LONG_CAUTION"
+        elif scalp_short:
+            decision = "SCALP_SHORT_CAUTION"
+        elif exit_cond:
             decision = "EXIT"
         elif buy_cond:
             decision = "BUY"
-        elif total >= 4 and price_vs_cloud == "above":
+        elif (total >= 4 and price_vs_cloud == "above") or cloud_retest:
             decision = "WATCH"
         else:
             decision = "HOLD"
-
-        prev_decision = prev_map.get(symbol, "")
         strategy_rows.append([symbol, dt_str, decision, total, reasons, prev_decision])
 
-        if decision != prev_decision and decision in ("BUY", "EXIT"):
+        if decision != prev_decision and decision in ("BUY", "EXIT", "SCALP_LONG_CAUTION", "SCALP_SHORT_CAUTION"):
             transitions.append({
                 "symbol":   symbol,
                 "decision": decision,
@@ -550,6 +716,8 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
                 "rsi_zone": rsi_zone,
                 "rsi_div":  rsi_div,
                 "date":     dt_str,
+                "kijun":    kijun_f,
+                "rsi":      rsi_f,
             })
 
     ch_insert("signals.strategy_1h",
@@ -603,6 +771,27 @@ def _compute_signals(symbols: list[str], end_date: date | None = None,
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 
+def _format_ingest_slack(output: str) -> str:
+    """Format email-ingest slog output into a clean Slack notification."""
+    import re
+    lines = []
+    skipped = 0
+    for line in output.splitlines():
+        m = re.search(
+            r"INFO parsed.*?code=(\S+)\s+symbol=(\S+)\s+qty=(\S+)\s+price=(\S+)", line
+        )
+        if m:
+            code, symbol, qty, price = m.groups()
+            lines.append(f"• {code} {symbol} ×{qty} @ ${float(price):.2f}")
+        elif "skipped as non-trade" in line:
+            skipped += 1
+    header = f"📥 *{len(lines)} order{'s' if len(lines) != 1 else ''} ingested*"
+    parts = [header] + lines
+    if skipped:
+        parts.append(f"_{skipped} non-trade email{'s' if skipped != 1 else ''} skipped_")
+    return "\n".join(parts)
+
+
 def job_email_ingest():
     """Poll Gmail for unseen Robinhood order emails and ingest into ClickHouse."""
     binary = os.path.join(REPO_DIR, "bin", "email-ingest")
@@ -632,7 +821,7 @@ def job_email_ingest():
             if SLACK_INGEST_WEBHOOK_URL:
                 try:
                     _slack_post(SLACK_INGEST_WEBHOOK_URL,
-                                f"📥 Robinhood order ingested\n_{output}_")
+                                _format_ingest_slack(output))
                 except Exception as e:
                     log.error("job_email_ingest: Slack post failed — %s", e)
     except Exception as e:
@@ -702,6 +891,9 @@ def job_intraday():
     Scheduled at :30 past each hour from 09:30 to 15:30 ET — right after each NYSE hourly
     bar closes. Computes Ichimoku/RSI/volume on 1h candles and evaluates the same
     BUY/WATCH/HOLD/EXIT strategy. Alerts only on transitions.
+
+    Also refreshes daily prices + signals so the daily dashboard stays current
+    throughout the trading day, not just after the 16:30 close run.
     """
     if not is_trading_day():
         log.info("job_intraday: skipping — not a trading day")
@@ -709,6 +901,13 @@ def job_intraday():
 
     log.info("=== job_intraday start ===")
     symbols = all_symbols()
+
+    # Refresh daily prices + signals with latest available bars
+    try:
+        _ingest_prices(symbols, end_date=date.today())
+        _compute_signals(symbols, end_date=date.today(), start_date=date.today())
+    except Exception as e:
+        log.error("job_intraday: daily refresh failed — %s", e)
 
     try:
         _compute_signals_intraday(symbols)
@@ -723,9 +922,50 @@ def job_intraday():
         transitions = []
 
     if transitions:
-        send_alert(transitions)
+        # Alert on: open options positions (time-sensitive) + explicit watchlist symbols.
+        # Crypto is handled separately by job_crypto_intraday.
+        opt_syms    = _option_symbols()
+        crypto_rows = ch_query("SELECT DISTINCT symbol FROM portfolio.crypto_positions")
+        crypto_syms = {r[0] for r in crypto_rows}
+        alert_syms  = opt_syms | WATCHLIST
+        opt_transitions = [t for t in transitions
+                           if t["symbol"] in alert_syms and t["symbol"] not in crypto_syms]
+        if opt_transitions:
+            send_alert(opt_transitions, webhook_url=SLACK_OPTIONS_WEBHOOK_URL or SLACK_WEBHOOK_URL)
 
     log.info("=== job_intraday done ===")
+
+
+def job_crypto_intraday():
+    """Run the 1h signal pipeline for crypto symbols only — no NYSE gate, runs 24/7.
+
+    Scheduled at :30 every hour so crypto positions get evaluated outside market hours
+    and on weekends when job_intraday is skipped.
+    """
+    crypto_rows = ch_query("SELECT DISTINCT symbol FROM portfolio.crypto_positions")
+    crypto_symbols = [r[0] for r in crypto_rows]
+    if not crypto_symbols:
+        log.info("job_crypto_intraday: no crypto positions — skipping")
+        return
+
+    log.info("=== job_crypto_intraday start === symbols=%s", crypto_symbols)
+
+    try:
+        _compute_signals_intraday(crypto_symbols)
+    except Exception as e:
+        log.error("job_crypto_intraday: compute_signals_intraday failed — %s", e)
+        return
+
+    try:
+        transitions = evaluate_strategy_intraday(crypto_symbols, alert=True)
+    except Exception as e:
+        log.error("job_crypto_intraday: evaluate_strategy_intraday failed — %s", e)
+        transitions = []
+
+    if transitions:
+        send_alert(transitions, webhook_url=SLACK_CRYPTO_WEBHOOK_URL or SLACK_WEBHOOK_URL)
+
+    log.info("=== job_crypto_intraday done ===")
 
 
 def job_news():
@@ -775,7 +1015,8 @@ def job_close(target_date: date | None = None, alert: bool = True):
         transitions = []
 
     if alert:
-        send_alert(transitions or [])
+        # Daily close signals go to the main channel — authoritative for all position types
+        send_alert(transitions or [], webhook_url=SLACK_WEBHOOK_URL)
         log.info("step 4/4: transitions=%d", len(transitions or []))
     else:
         log.info("step 4/4: alert suppressed (backfill)")
@@ -815,7 +1056,10 @@ def job_backfill(start: date, end: date):
     # Compute signals once per symbol for the full range
     log.info("step 2: compute signals for %s → %s", start, end)
     try:
-        _compute_signals(symbols, end_date=end, start_date=start)
+        # start_date intentionally omitted — Ichimoku needs 52+ bars of history to
+        # compute correctly. Passing a narrow start_date starves the calculation.
+        # end_date caps the output to the requested range.
+        _compute_signals(symbols, end_date=end)
     except Exception as e:
         log.error("compute_signals failed — %s", e)
 
@@ -888,6 +1132,7 @@ def main():
     job_email_ingest()
     job_news()
     job_intraday()
+    job_crypto_intraday()
 
     scheduler = BlockingScheduler(timezone="America/New_York")
 
@@ -903,25 +1148,33 @@ def main():
         timezone="America/New_York",
     ), id="job_intraday", name="Intraday signals")
 
+    # Crypto intraday: runs at :30 every hour, 24/7 — no NYSE gate.
+    # job_intraday already covers crypto during market hours; this catches
+    # evenings, nights, weekends, and holidays.
+    scheduler.add_job(job_crypto_intraday, CronTrigger(
+        minute=30,
+    ), id="job_crypto_intraday", name="Crypto 24/7 intraday")
+
     scheduler.add_job(job_close, CronTrigger(
         day_of_week="mon-fri", hour=16, minute=30,
         timezone="America/New_York",
     ), id="job_close", name="Post-close pipeline")
 
-    # Email ingest: poll Gmail every 30min, every day
+    # Email ingest: poll Gmail every 5min, every day
     scheduler.add_job(job_email_ingest, CronTrigger(
-        minute="*/30",
+        minute="*/5",
         timezone="America/New_York",
     ), id="job_email_ingest", name="Email ingest")
 
-    # Weekly LLM insights: Monday morning before market open
-    scheduler.add_job(job_gen_insights, CronTrigger(
-        day_of_week="mon", hour=7, minute=0,
-        timezone="America/New_York",
-    ), id="job_gen_insights", name="Generate insights")
+    # gen_insights disabled — requires CCR_BASE_URL (Claude API proxy) not available in container
+    # scheduler.add_job(job_gen_insights, CronTrigger(
+    #     day_of_week="mon", hour=7, minute=0,
+    #     timezone="America/New_York",
+    # ), id="job_gen_insights", name="Generate insights")
 
     log.info("trader daemon starting — job_news@*/30, job_intraday@:30(09:30-15:30), "
-             "job_close@16:30, job_email_ingest@*/30, job_gen_insights@Mon07:00 ET")
+             "job_close@16:30, job_email_ingest@*/5, "
+             "job_crypto_intraday@:30(24/7)")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

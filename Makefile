@@ -145,6 +145,7 @@ trader-backfill-intraday:
 ## Build binaries and redeploy the trader Docker container.
 ## Run this after any code change or first-time setup.
 trader-deploy: build-email
+	cp config.env $(dir $(TRADER_COMPOSE))config.env
 	docker compose -f $(TRADER_COMPOSE) up -d --force-recreate
 	@echo "  trader redeployed — logs: docker logs trader -f"
 

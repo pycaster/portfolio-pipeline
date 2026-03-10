@@ -78,8 +78,9 @@ LOCALAI_MODEL = os.environ.get("LOCALAI_MODEL", "classifier")
 # Reddit: using /hot.rss to filter by engagement (avoids low-quality spam from /new).
 
 RSS_SOURCES = {
-    "zerohedge":  "https://feeds.feedburner.com/zerohedge/feed",
-    "reddit_wsb": "https://www.reddit.com/r/wallstreetbets/hot.rss",
+    "zerohedge":       "https://feeds.feedburner.com/zerohedge/feed",
+    "reddit_wsb_dd":   "https://old.reddit.com/r/wallstreetbets/search.rss?q=flair%3ADD&restrict_sr=on&sort=new&limit=25",
+    "reddit_wsb_news": "https://old.reddit.com/r/wallstreetbets/search.rss?q=flair%3ANews&restrict_sr=on&sort=new&limit=25",
 }
 
 # SEC EDGAR Form 4 feeds — insider buy/sell filings, one per held ticker.
@@ -88,7 +89,7 @@ SEC_USER_AGENT = "portfolio-pipeline venkat@vrmap.net"
 EDGAR_SOURCES = {
     "nvda": "1045810",   # NVIDIA
     "pltr": "1321655",   # Palantir
-    "iren": "1517767",   # IREN (Iris Energy)
+    "iren": "1878848",   # IREN Ltd (Iris Energy)
 }
 
 # DD-quality keywords in post title (elevates signal weight)
@@ -152,10 +153,10 @@ def strip_html(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def fetch_rss(url):
+def fetch_rss(url, llm_tickers=False):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "portfolio-pipeline/newsfeed"},
+        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"},
     )
     with urllib.request.urlopen(req, timeout=20) as resp:
         content = resp.read()
@@ -203,7 +204,8 @@ def fetch_rss(url):
 
         article_id = hashlib.sha256(link.encode()).hexdigest()[:32]
         full_text  = strip_html(raw)[:2000]
-        tickers    = list(dict.fromkeys(re.findall(r"\$([A-Z]{1,6})\b", title + " " + full_text)))
+        tickers    = extract_tickers(title, full_text) if llm_tickers \
+                     else list(dict.fromkeys(re.findall(r"\$([A-Z]{1,6})\b", title + " " + full_text)))
 
         articles.append({
             "article_id": article_id,
@@ -225,7 +227,7 @@ def fetch_edgar_form4(ticker, cik):
     """
     feed_url = (
         f"https://www.sec.gov/cgi-bin/browse-edgar"
-        f"?action=getcompany&CIK={cik}&type=4&dateb=&owner=include&count=10&search_text=&output=atom"
+        f"?action=getcompany&CIK={cik}&type=4&dateb=&owner=include&count=40&search_text=&output=atom"
     )
     req = urllib.request.Request(
         feed_url,
@@ -239,6 +241,12 @@ def fetch_edgar_form4(ticker, cik):
     articles = []
 
     for entry in root.findall(f"{ns}entry"):
+        # Skip non-Form-4 entries (type=4 prefix matches 424B5, 497AD, etc.)
+        cat_el = entry.find(f"{ns}category")
+        form_type = cat_el.get("term", "") if cat_el is not None else ""
+        if form_type not in ("4", "4/A"):
+            continue
+
         link_el = entry.find(f"{ns}link")
         index_url = link_el.get("href") if link_el is not None else ""
         if not index_url:
@@ -262,8 +270,10 @@ def fetch_edgar_form4(ticker, cik):
             with urllib.request.urlopen(idx_req, timeout=15) as r:
                 idx_html = r.read().decode(errors="replace")
 
-            # Find the .xml form4 link in the index HTML
-            xml_match = re.search(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_html)
+            # Find the raw Form 4 XML (skip xslFxxx/ XSLT-rendered HTML versions)
+            xml_match = re.search(
+                r'href="(/Archives/edgar/data/\d+/[^"/]+/(?!xsl)[^"/]+\.xml)"', idx_html
+            )
             if not xml_match:
                 continue
             form_url = "https://www.sec.gov" + xml_match.group(1)
@@ -287,15 +297,26 @@ def fetch_edgar_form4(ticker, cik):
                    else "Insider"
 
             # Get all non-derivative transactions
+            # transactionCode: P=open-market buy, S=open-market sell, A=grant/award,
+            #   M=option exercise, F=tax withholding, G=gift, etc.
+            # acquiredDisposedCode: A=acquired, D=disposed (too coarse on its own)
+            TXN_LABELS = {
+                "P": "PURCHASE", "S": "SALE", "A": "GRANT", "M": "EXERCISE",
+                "F": "TAX_WITHHOLD", "G": "GIFT", "C": "CONVERT", "W": "WILL",
+                "X": "EXERCISE", "D": "DISPOSED",
+            }
             transactions = []
             for txn in form_root.findall(".//nonDerivativeTransaction"):
-                code_el = txn.find("transactionAmounts/transactionAcquiredDisposedCode/value")
+                txn_code_el = txn.find("transactionCoding/transactionCode")
                 shares_el = txn.find("transactionAmounts/transactionShares/value")
                 price_el = txn.find("transactionAmounts/transactionPricePerShare/value")
-                code = code_el.text if code_el is not None else "?"
+                txn_code = txn_code_el.text.strip() if txn_code_el is not None else "?"
                 shares = shares_el.text if shares_el is not None else "0"
                 price = price_el.text if price_el is not None else "0"
-                action = "BUY" if code == "A" else "SELL" if code == "D" else code
+                action = TXN_LABELS.get(txn_code, txn_code)
+                # Skip non-market events (grants, tax withholding, gifts) from signal
+                if txn_code in ("A", "F", "G", "W"):
+                    continue
                 try:
                     total = float(shares) * float(price)
                     transactions.append(f"{action} {float(shares):,.0f} shares @ ${float(price):.2f} (${total:,.0f})")
@@ -326,9 +347,53 @@ def fetch_edgar_form4(ticker, cik):
     return articles
 
 
-# ── qwen3.5 sector classification ───────────────────────────────────────────
+# ── qwen3.5 ticker extraction + sector classification ───────────────────────
 
 SECTOR_LIST = list(SECTOR_DEFINITIONS.keys())
+
+TICKER_PROMPT = """\
+Extract all US stock ticker symbols mentioned in this financial article.
+Include tickers referenced by company name (e.g. "Nvidia" → NVDA, "Marathon Petroleum" → MPC).
+Only include real, traded US equity tickers. Exclude ETFs, indices, currencies.
+
+Article title: {title}
+Article text: {text}
+
+Output a JSON array of uppercase ticker strings. Output the array and nothing else."""
+
+TICKER_MODEL = "qwen3.5"  # needs world knowledge; classifier is too small
+
+
+def extract_tickers(title, full_text):
+    """Use qwen3.5 to extract ticker symbols from article title+text."""
+    prompt = TICKER_PROMPT.format(title=title, text=full_text[:500])
+    payload = json.dumps({
+        "model": TICKER_MODEL,
+        "max_tokens": 2048,  # thinking model needs budget before answering
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        LOCALAI_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        msg = result["choices"][0]["message"]
+        # qwen3.5 is a thinking model: answer is in content when tokens allow,
+        # otherwise appended at end of reasoning. Take the LAST [...] match.
+        raw = msg.get("content") or msg.get("reasoning", "")
+        matches = re.findall(r"\[[^\[\]]*\]", raw)
+        if not matches:
+            return []
+        tickers = json.loads(matches[-1])
+        return [t.upper() for t in tickers if isinstance(t, str) and re.match(r"^[A-Z]{1,6}$", t)]
+    except Exception as e:
+        print(f"  WARN: ticker extraction failed: {e}", file=sys.stderr)
+        return []
+
 
 SECTOR_PROMPT = """\
 Classify this financial news article into ALL relevant sectors.
@@ -435,7 +500,7 @@ def cmd_ingest():
     for source, rss_url in RSS_SOURCES.items():
         print(f"  fetching {source}...")
         try:
-            articles = fetch_rss(rss_url)
+            articles = fetch_rss(rss_url, llm_tickers=(source == "reddit_wsb_dd"))
         except Exception as e:
             print(f"  WARN: failed to fetch {source}: {e}", file=sys.stderr)
             continue

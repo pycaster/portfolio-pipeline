@@ -18,8 +18,13 @@ import (
 var optionRe = regexp.MustCompile(`^(\w+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+([\d.]+)(C|P)$`)
 
 // optionDescRe matches the Robinhood Description column for option trades:
-// e.g. "NVDA 1/30/2026 Put $170.00" or "AAPL 2/20/2026 Call $200.00"
-var optionDescRe = regexp.MustCompile(`^(\w+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(Call|Put)\s+\$([\d.]+)$`)
+// e.g. "NVDA 1/30/2026 Put $170.00" or "NFLX 4/17/2025 Call $1,000.00"
+// Note: strike prices can contain commas (e.g. $1,000.00) — [\d,.]+ handles both.
+var optionDescRe = regexp.MustCompile(`^(\w+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(Call|Put)\s+\$([\d,.]+)$`)
+
+// optionExpiryDescRe matches Robinhood's option expiration description:
+// e.g. "Option Expiration for SPY 4/1/2025 Call $565.00"
+var optionExpiryDescRe = regexp.MustCompile(`^Option Expiration for (\w+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(Call|Put)\s+\$([\d,.]+)$`)
 
 // Robinhood implements broker.Broker for Robinhood CSV exports.
 //
@@ -165,9 +170,21 @@ func parseInstrument(instrument, description string) (
 		strike, _ := strconv.ParseFloat(m[3], 64)
 		return strings.ToUpper(m[1]), "OPTION", &expiry, &strike, m[4]
 	}
-	if m := optionDescRe.FindStringSubmatch(strings.TrimSpace(description)); m != nil {
+	desc := strings.TrimSpace(description)
+	if m := optionDescRe.FindStringSubmatch(desc); m != nil {
 		expiry, _ := time.Parse("1/2/2006", m[2])
-		strike, _ := strconv.ParseFloat(m[4], 64)
+		strikeStr := strings.ReplaceAll(m[4], ",", "")
+		strike, _ := strconv.ParseFloat(strikeStr, 64)
+		optType := "C"
+		if strings.EqualFold(m[3], "Put") {
+			optType = "P"
+		}
+		return strings.ToUpper(m[1]), "OPTION", &expiry, &strike, optType
+	}
+	if m := optionExpiryDescRe.FindStringSubmatch(desc); m != nil {
+		expiry, _ := time.Parse("1/2/2006", m[2])
+		strikeStr := strings.ReplaceAll(m[4], ",", "")
+		strike, _ := strconv.ParseFloat(strikeStr, 64)
 		optType := "C"
 		if strings.EqualFold(m[3], "Put") {
 			optType = "P"

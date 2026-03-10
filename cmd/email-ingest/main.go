@@ -71,18 +71,10 @@ func main() {
 		txn, err := robinhood.ParseEmail(msg.Body, sourceFile)
 		if err != nil {
 			slog.Warn("parse failed", "uid", msg.UID, "err", err)
-			dumpFile := fmt.Sprintf("/tmp/robinhood-email-%d.txt", msg.UID)
-			if werr := os.WriteFile(dumpFile, []byte(msg.Body), 0600); werr == nil {
-				slog.Info("body dumped", "file", dumpFile)
-			}
 			continue
 		}
 		if txn == nil {
 			slog.Warn("skipped as non-trade email", "uid", msg.UID)
-			dumpFile := fmt.Sprintf("/tmp/robinhood-email-%d.txt", msg.UID)
-			if werr := os.WriteFile(dumpFile, []byte(msg.Body), 0600); werr == nil {
-				slog.Info("body dumped for inspection", "file", dumpFile)
-			}
 			continue
 		}
 		slog.Info("parsed", "uid", msg.UID,
@@ -110,12 +102,13 @@ func main() {
 	}
 	defer s.Close()
 
-	n, err := s.InsertTransactions(context.Background(), txns)
+	ctx := context.Background()
+
+	n, err := s.InsertTransactions(ctx, txns)
 	if err != nil {
 		slog.Error("insert", "err", err)
 		os.Exit(1)
 	}
-
 	slog.Info("inserted", "count", n)
 }
 
