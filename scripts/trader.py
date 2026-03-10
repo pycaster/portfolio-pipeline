@@ -161,7 +161,7 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
     rows = ch_query(f"""
         SELECT
             symbol, signal_score, rsi_zone, price_vs_cloud, tk_cross,
-            rsi_divergence, vol_ratio, obv_trend, vol_signal, close,
+            vol_ratio, obv_trend, vol_signal, close,
             kijun, cloud_color
         FROM signals.indicators FINAL
         WHERE symbol IN ({sym_list}) AND date = '{today_s}'
@@ -188,7 +188,7 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
 
     for r in rows:
         (symbol, signal_score, rsi_zone, price_vs_cloud,
-         tk_cross, rsi_div, vol_ratio, obv_trend, vol_signal, close,
+         tk_cross, vol_ratio, obv_trend, vol_signal, close,
          kijun, cloud_color) = r
 
         signal_score  = int(signal_score)
@@ -207,9 +207,6 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
             reasons.append(f"tk_{tk_cross}")
         elif tk_cross in ("bearish_cross", "bearish"):
             reasons.append(f"tk_{tk_cross}")
-
-        if rsi_div:
-            reasons.append(rsi_div)
 
         if vol_signal != "neutral":
             reasons.append(f"{vol_signal} (vol {vol_ratio:.1f}x avg)")
@@ -247,19 +244,12 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
         if cloud_reclaim:
             reasons.append("cloud_reclaim")
 
-        # Ichimoku score drives EXIT/BUY thresholds.
-        # RSI zone and divergence type are context guards — they don't affect the score,
-        # but they gate conditions: oversold = don't exit (bottom risk), overbought+bearish_div = exit.
         exit_cond = (
             (
-                # Ichimoku fully bearish — but not during a bounce (hidden_bear = near-term up)
-                (total <= -5 and rsi_div != "hidden_bear")
-                # Exhaustion at a confirmed top: overbought + reversal divergence
-                or (rsi_zone == "overbought" and rsi_div == "bearish_div")
-                # Confirmed distribution below cloud — requires at least partial bearish structure
+                total <= -5
                 or (total <= -3 and price_vs_cloud == "below" and vol_signal == "distribution")
             )
-            and rsi_zone != "oversold"  # never exit when already oversold — highest bounce risk
+            and rsi_zone != "oversold"
         )
         buy_cond = (
             (
@@ -268,7 +258,7 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
                 and rsi_zone != "overbought"
                 and price_vs_cloud == "above"
             )
-            or cloud_reclaim  # reclaiming cloud after confirmed Kijun support
+            or cloud_reclaim
         )
 
         if exit_cond:
@@ -291,7 +281,6 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
                 "reasons":  reasons,
                 "close":    float(close),
                 "rsi_zone": rsi_zone,
-                "rsi_div":  rsi_div,
                 "date":     today_s,
             })
 
@@ -422,6 +411,7 @@ def _ingest_prices(symbols: list[str], end_date: date | None = None,
             if hasattr(df.columns, "get_level_values"):
                 df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
+            df = df.loc[:, ~df.columns.duplicated()]  # guard against multi-ticker column bleed
             df = df.dropna(subset=["open", "high", "low", "close", "volume"])
             # Trim to requested end_date
             df = df[df.index.date <= end]
@@ -456,7 +446,7 @@ def _compute_signals_intraday(symbols: list[str]):
         "rsi_14", "rsi_zone",
         "tenkan", "kijun", "senkou_a", "senkou_b",
         "cloud_color", "price_vs_cloud", "tk_cross",
-        "rsi_divergence", "signal", "signal_score",
+        "signal", "signal_score",
         "vol_ratio", "obv_trend", "vol_signal",
     ]
 
@@ -512,7 +502,7 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
     rows = ch_query(f"""
         SELECT
             symbol, signal_score, rsi_zone, price_vs_cloud, tk_cross,
-            rsi_divergence, vol_ratio, obv_trend, vol_signal, close, datetime,
+            vol_ratio, obv_trend, vol_signal, close, datetime,
             kijun, cloud_color, tenkan, rsi_14
         FROM signals.indicators_1h FINAL
         WHERE symbol IN ({sym_list})
@@ -573,7 +563,7 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
 
     for r in rows:
         (symbol, signal_score, rsi_zone, price_vs_cloud,
-         tk_cross, rsi_div, vol_ratio, obv_trend, vol_signal, close, dt_str,
+         tk_cross, vol_ratio, obv_trend, vol_signal, close, dt_str,
          kijun, cloud_color, tenkan, rsi_14) = r
 
         signal_score   = int(signal_score)
@@ -598,9 +588,6 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
             reasons.append(f"tk_{tk_cross}")
         elif tk_cross in ("bearish_cross", "bearish"):
             reasons.append(f"tk_{tk_cross}")
-
-        if rsi_div:
-            reasons.append(rsi_div)
 
         if vol_signal != "neutral":
             reasons.append(f"{vol_signal} (vol {vol_ratio:.1f}x avg)")
@@ -638,28 +625,20 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
         if cloud_reclaim:
             reasons.append("cloud_reclaim")
 
-        # Scalp long: oversold RSI bounce back above Tenkan, flat Kijun as magnet above.
-        # Fires when current bar OR previous bar was oversold — catches the common case
-        # where RSI bottoms in bar N but tenkan reclaim happens in bar N+1.
-        # Counter-trend — only valid below cloud. Divergence confirmation left to trader.
-        kijun_proximity = abs(kijun_f - close_f) / close_f < 0.015  # Kijun within 1.5%
+        kijun_proximity = abs(kijun_f - close_f) / close_f < 0.015
         scalp_long = (
             rsi_was_oversold
             and price_vs_cloud == "below"
             and close_f >= tenkan_f
-            and kijun_f > close_f        # Kijun is above — acts as magnet
+            and kijun_f > close_f
             and kijun_proximity
             and kijun_flat
         )
-
-        # Scalp short: overbought RSI fade below Tenkan, flat Kijun as magnet below.
-        # Same prev-bar logic applied symmetrically.
-        # Counter-trend — only valid above cloud.
         scalp_short = (
             rsi_was_overbought
             and price_vs_cloud == "above"
             and close_f <= tenkan_f
-            and kijun_f < close_f        # Kijun is below — acts as magnet
+            and kijun_f < close_f
             and kijun_proximity
             and kijun_flat
         )
@@ -669,11 +648,9 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
         if scalp_short:
             reasons.append(f"scalp_short (RSI {rsi_f:.0f}, kijun target {kijun_f:.2f})")
 
-        # Same strategy logic as daily — Ichimoku drives score, RSI is context guard
         exit_cond = (
             (
-                (total <= -5 and rsi_div != "hidden_bear")
-                or (rsi_zone == "overbought" and rsi_div == "bearish_div")
+                total <= -5
                 or (total <= -3 and price_vs_cloud == "below" and vol_signal == "distribution")
             )
             and rsi_zone != "oversold"
@@ -685,12 +662,9 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
                 and rsi_zone != "overbought"
                 and price_vs_cloud == "above"
             )
-            or cloud_reclaim  # reclaiming cloud after confirmed Kijun support
+            or cloud_reclaim
         )
 
-        # Scalp signals take priority over EXIT/HOLD — they are explicitly counter-trend.
-        # An EXIT tells you the trend is down; SCALP_LONG_CAUTION tells you there's a short-term
-        # bounce setup within that downtrend. Both can be true simultaneously.
         if scalp_long:
             decision = "SCALP_LONG_CAUTION"
         elif scalp_short:
@@ -714,7 +688,6 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
                 "reasons":  reasons,
                 "close":    float(close),
                 "rsi_zone": rsi_zone,
-                "rsi_div":  rsi_div,
                 "date":     dt_str,
                 "kijun":    kijun_f,
                 "rsi":      rsi_f,
@@ -745,7 +718,7 @@ def _compute_signals(symbols: list[str], end_date: date | None = None,
         "rsi_14", "rsi_zone",
         "tenkan", "kijun", "senkou_a", "senkou_b",
         "cloud_color", "price_vs_cloud", "tk_cross",
-        "rsi_divergence", "signal", "signal_score",
+        "signal", "signal_score",
         "vol_ratio", "obv_trend", "vol_signal",
     ]
 
@@ -757,7 +730,29 @@ def _compute_signals(symbols: list[str], end_date: date | None = None,
                                                        start_date=start_date)
         if not records:
             continue
-        rows = [[r[c] for c in columns] for r in records]
+
+        # Sanity-check: reject any record whose close deviates > 20% from the
+        # prices table for that date. Catches yfinance data contamination (e.g.
+        # AMD showing BTC-level prices) before it corrupts the indicators table.
+        price_rows = ch_query(f"""
+            SELECT date, close FROM portfolio.prices FINAL
+            WHERE symbol = '{symbol}'
+              AND date >= '{records[0]["date"]}' AND date <= '{records[-1]["date"]}'
+        """)
+        price_map = {str(r[0]): float(r[1]) for r in price_rows}
+        clean = []
+        for rec in records:
+            ref = price_map.get(str(rec["date"]))
+            if ref and ref > 0:
+                ratio = abs(float(rec["close"]) - ref) / ref
+                if ratio > 0.20:
+                    log.warning("signals sanity: %s %s close=%.2f vs prices=%.2f (%.0f%%) — skipped",
+                                symbol, rec["date"], rec["close"], ref, ratio * 100)
+                    continue
+            clean.append(rec)
+        if not clean:
+            continue
+        rows = [[r[c] for c in columns] for r in clean]
         ch_insert("signals.indicators", columns, rows)
         total += len(rows)
         latest = records[-1]

@@ -279,6 +279,7 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None,
     if hasattr(df.columns, "get_level_values"):
         df.columns = df.columns.get_level_values(0)
     df.columns = [c.lower() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]  # guard against multi-ticker column bleed
     df = df.dropna(subset=["open", "high", "low", "close", "volume"])
 
     if len(df) < SENKOU_B_PERIOD + DISPLACEMENT:
@@ -292,7 +293,6 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None,
 
     rsi  = compute_rsi(close)
     ichi = compute_ichimoku(high, low, close)
-    div  = compute_divergence(close, rsi)
 
     # Volume signals
     vol_avg    = volume.rolling(20).mean()
@@ -375,9 +375,6 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None,
         }
         score, _ = score_signal(pd.Series(current), pd.Series(prev_row) if prev_row else None)
 
-        # Divergences are stored as context labels — they do NOT contribute to signal_score.
-        # Ichimoku drives the score; RSI zone and divergence type are used as guards in strategy.
-        r_div       = str(div.iloc[i])
         total_score = score
         if total_score >= 4:
             signal = "bullish"
@@ -399,7 +396,7 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None,
             "cloud_color":    cloud_color,
             "price_vs_cloud": price_vs_cloud,
             "tk_cross":       tk_cross,
-            "rsi_divergence": r_div,
+            "rsi_divergence": "",
             "signal":         signal,
             "signal_score":   total_score,
             "vol_ratio":      round(float(vol_ratio.iloc[i]), 4),
@@ -445,6 +442,7 @@ def compute_for_symbol_1h(symbol: str, yf_ticker: str | None = None) -> list[dic
     if hasattr(df.columns, "get_level_values"):
         df.columns = df.columns.get_level_values(0)
     df.columns = [c.lower() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]  # guard against multi-ticker column bleed
     df = df.dropna(subset=["open", "high", "low", "close", "volume"])
 
     if len(df) < MIN_BARS:
@@ -458,7 +456,6 @@ def compute_for_symbol_1h(symbol: str, yf_ticker: str | None = None) -> list[dic
 
     rsi  = compute_rsi(close)
     ichi = compute_ichimoku(high, low, close)
-    div  = compute_divergence(close, rsi)
 
     vol_avg   = volume.rolling(20).mean()
     vol_ratio = (volume / vol_avg.replace(0, np.nan)).fillna(0)
@@ -565,7 +562,7 @@ def compute_for_symbol_1h(symbol: str, yf_ticker: str | None = None) -> list[dic
             "cloud_color":    cloud_color,
             "price_vs_cloud": price_vs_cloud,
             "tk_cross":       tk_cross,
-            "rsi_divergence": r_div,
+            "rsi_divergence": "",
             "signal":         signal,
             "signal_score":   total_score,
             "vol_ratio":      round(float(vol_ratio.iloc[i]), 4),
@@ -649,13 +646,11 @@ def main():
         # Print today's signal summary
         latest  = records[-1]
         rsi_str = f"{latest['rsi_14']:.1f}" if latest["rsi_14"] else "n/a"
-        div_str = f"  div={latest['rsi_divergence']}" if latest["rsi_divergence"] else ""
         print(
             f"  {symbol:<8} {latest['date']}  close={latest['close']:.2f}"
             f"  RSI={rsi_str} [{latest['rsi_zone']}]"
             f"  cloud={latest['price_vs_cloud']} ({latest['cloud_color']})"
             f"  TK={latest['tk_cross']}"
-            f"{div_str}"
             f"  → {latest['signal'].upper()} (score={latest['signal_score']:+d})"
         )
 
