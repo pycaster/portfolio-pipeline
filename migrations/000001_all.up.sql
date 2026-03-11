@@ -394,7 +394,8 @@ CREATE TABLE IF NOT EXISTS signals.strategy (
     decision      LowCardinality(String),   -- BUY | WATCH | HOLD | EXIT
     score         Int8,
     reasons       Array(String),
-    prev_decision LowCardinality(String) DEFAULT ''
+    prev_decision LowCardinality(String) DEFAULT '',
+    signal_id     String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (symbol, date);
 
@@ -437,7 +438,8 @@ CREATE TABLE IF NOT EXISTS signals.strategy_1h (
     decision      LowCardinality(String),
     score         Int8,
     reasons       Array(String),
-    prev_decision LowCardinality(String) DEFAULT ''
+    prev_decision LowCardinality(String) DEFAULT '',
+    signal_id     String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (symbol, datetime);
 
@@ -526,3 +528,21 @@ CREATE TABLE IF NOT EXISTS signals.outcomes (
     computed_at     DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(computed_at)
 ORDER BY (symbol, signal_date);
+
+-- ─────────────────────────────────────────────
+-- signals.trades
+-- ─────────────────────────────────────────────
+-- Human-confirmed trade executions, linked back to the signal that prompted them.
+-- Populated by Sally via log_trade.py when Venkat replies "executed SYMBOL Nsh @PRICE".
+-- signal_id joins to signals.strategy/strategy_1h via the sig:XXXX stamp in alerts.
+CREATE TABLE IF NOT EXISTS signals.trades (
+    signal_id   String,
+    symbol      LowCardinality(String),
+    decision    LowCardinality(String),
+    signal_date String,
+    executed_at DateTime DEFAULT now(),
+    shares      Float64,
+    price       Float64,
+    notes       String DEFAULT ''
+) ENGINE = ReplacingMergeTree(executed_at)
+ORDER BY (signal_date, symbol, signal_id);

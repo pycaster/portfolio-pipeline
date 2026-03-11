@@ -19,6 +19,7 @@ Usage:
     python scripts/trader.py --backfill 2026-02-24 2026-03-07  # date range
 """
 
+import hashlib
 import os
 import sys
 import json
@@ -162,7 +163,7 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
         SELECT
             symbol, signal_score, rsi_zone, price_vs_cloud, tk_cross,
             vol_ratio, obv_trend, vol_signal, close,
-            kijun, cloud_color
+            kijun, cloud_color, senkou_a, senkou_b
         FROM signals.indicators FINAL
         WHERE symbol IN ({sym_list}) AND date = '{today_s}'
     """)
@@ -189,12 +190,13 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
     for r in rows:
         (symbol, signal_score, rsi_zone, price_vs_cloud,
          tk_cross, vol_ratio, obv_trend, vol_signal, close,
-         kijun, cloud_color) = r
+         kijun, cloud_color, senkou_a, senkou_b) = r
 
         signal_score  = int(signal_score)
         vol_ratio     = float(vol_ratio)
         close_f       = float(close)
         kijun_f       = float(kijun)
+        cloud_top_f   = max(float(senkou_a), float(senkou_b))
         prev_decision = prev_map.get(symbol, "")
         reasons       = []
 
@@ -270,28 +272,34 @@ def evaluate_strategy(symbols: list[str], target_date: date | None = None,
         else:
             decision = "HOLD"
 
-        strategy_rows.append([symbol, today_s, decision, total, reasons, prev_decision])
+        signal_id = hashlib.sha256(
+            f"{symbol}:{today_s}:{decision}".encode()
+        ).hexdigest()[:6]
+        strategy_rows.append([symbol, today_s, decision, total, reasons, prev_decision, signal_id])
 
         if decision != prev_decision and decision in ("BUY", "EXIT"):
             transitions.append({
-                "symbol":   symbol,
-                "decision": decision,
-                "prev":     prev_decision,
-                "score":    total,
-                "reasons":  reasons,
-                "close":    float(close),
-                "rsi_zone": rsi_zone,
-                "date":     today_s,
+                "symbol":    symbol,
+                "decision":  decision,
+                "prev":      prev_decision,
+                "score":     total,
+                "reasons":   reasons,
+                "close":     float(close),
+                "rsi_zone":  rsi_zone,
+                "date":      today_s,
+                "kijun":     kijun_f,
+                "cloud_top": cloud_top_f,
+                "signal_id": signal_id,
             })
 
     ch_insert("signals.strategy",
-              ["symbol", "date", "decision", "score", "reasons", "prev_decision"],
+              ["symbol", "date", "decision", "score", "reasons", "prev_decision", "signal_id"],
               strategy_rows)
 
     # Only log per-symbol detail in live mode; backfill prints its own summary
     if alert:
         for row in strategy_rows:
-            sym, _, dec, score, rsns, _ = row
+            sym, _, dec, score, rsns, _, _sid = row
             log.info("  %-8s  %-5s  score=%+d  %s", sym, dec, score,
                      " | ".join(rsns[:3]))
         log.info("strategy: wrote %d rows for %s", len(strategy_rows), today_s)
@@ -336,14 +344,24 @@ def send_alert(transitions: list[dict], webhook_url: str = ""):
         close    = t["close"]
         date_str = t.get("date", "")
 
-        emoji = {"EXIT": "🚨", "BUY": "📈", "SCALP_LONG_CAUTION": "⚡↑", "SCALP_SHORT_CAUTION": "⚡↓"}.get(decision, "📈")
+        emoji       = {"EXIT": "🚨", "BUY": "📈", "SCALP_LONG_CAUTION": "⚡↑", "SCALP_SHORT_CAUTION": "⚡↓"}.get(decision, "📈")
         reasons_str = " | ".join(reasons[:4]) if reasons else "—"
+        signal_id   = t.get("signal_id", "")
+        kijun       = t.get("kijun")
+        cloud_top   = t.get("cloud_top")
+        sig_footer  = f"`sig:{signal_id}`" if signal_id else ""
 
-        # For scalp alerts, include Kijun target prominently
-        scalp_note = ""
-        if decision in ("SCALP_LONG_CAUTION", "SCALP_SHORT_CAUTION") and t.get("kijun"):
-            direction = "↑" if decision == "SCALP_LONG_CAUTION" else "↓"
-            scalp_note = f" | Target {direction} ${t['kijun']:.2f} (Kijun) | RSI {t.get('rsi', 0):.0f}"
+        # Levels line: stop and target derived from Ichimoku levels
+        levels_line = ""
+        if decision == "BUY" and kijun and cloud_top:
+            stop_pct   = (close - kijun) / close * 100
+            target_pct = (cloud_top - close) / close * 100
+            levels_line = f"\nStop: ${kijun:.2f} ({stop_pct:+.1f}%)  Target: ${cloud_top:.2f} ({target_pct:+.1f}%)"
+        elif decision in ("SCALP_LONG_CAUTION", "SCALP_SHORT_CAUTION") and kijun:
+            direction  = "↑" if decision == "SCALP_LONG_CAUTION" else "↓"
+            levels_line = f"\nTarget {direction} ${kijun:.2f} (Kijun) | RSI {t.get('rsi', 0):.0f}"
+        elif decision == "EXIT" and kijun:
+            levels_line = f"\nKijun: ${kijun:.2f}"
 
         # For EXIT, show how much is held so the urgency is clear
         held_note = ""
@@ -366,9 +384,10 @@ def send_alert(transitions: list[dict], webhook_url: str = ""):
                 pass
 
         msg = (
-            f"{emoji} *{decision} — {symbol}* @ ${close:.2f}{held_note}{scalp_note}\n"
-            f"Score: {score:+d} | {reasons_str}\n"
-            f"_{date_str}_"
+            f"{emoji} *{decision} — {symbol}* @ ${close:.2f}{held_note}\n"
+            f"Score: {score:+d} | {reasons_str}"
+            f"{levels_line}\n"
+            f"_{date_str}_ {sig_footer}"
         )
         try:
             _slack_post(url, msg)
@@ -503,7 +522,7 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
         SELECT
             symbol, signal_score, rsi_zone, price_vs_cloud, tk_cross,
             vol_ratio, obv_trend, vol_signal, close, datetime,
-            kijun, cloud_color, tenkan, rsi_14
+            kijun, cloud_color, tenkan, rsi_14, senkou_a, senkou_b
         FROM signals.indicators_1h FINAL
         WHERE symbol IN ({sym_list})
           AND {indicator_filter}
@@ -564,12 +583,13 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
     for r in rows:
         (symbol, signal_score, rsi_zone, price_vs_cloud,
          tk_cross, vol_ratio, obv_trend, vol_signal, close, dt_str,
-         kijun, cloud_color, tenkan, rsi_14) = r
+         kijun, cloud_color, tenkan, rsi_14, senkou_a, senkou_b) = r
 
         signal_score   = int(signal_score)
         vol_ratio      = float(vol_ratio)
         close_f        = float(close)
         kijun_f        = float(kijun)
+        cloud_top_f    = max(float(senkou_a), float(senkou_b))
         tenkan_f       = float(tenkan) if tenkan else close_f
         rsi_f          = float(rsi_14) if rsi_14 else 50.0
         prev_decision  = prev_map.get(symbol, "")
@@ -677,29 +697,34 @@ def evaluate_strategy_intraday(symbols: list[str], alert: bool = True,
             decision = "WATCH"
         else:
             decision = "HOLD"
-        strategy_rows.append([symbol, dt_str, decision, total, reasons, prev_decision])
+        signal_id = hashlib.sha256(
+            f"{symbol}:{dt_str}:{decision}".encode()
+        ).hexdigest()[:6]
+        strategy_rows.append([symbol, dt_str, decision, total, reasons, prev_decision, signal_id])
 
         if decision != prev_decision and decision in ("BUY", "EXIT", "SCALP_LONG_CAUTION", "SCALP_SHORT_CAUTION"):
             transitions.append({
-                "symbol":   symbol,
-                "decision": decision,
-                "prev":     prev_decision,
-                "score":    total,
-                "reasons":  reasons,
-                "close":    float(close),
-                "rsi_zone": rsi_zone,
-                "date":     dt_str,
-                "kijun":    kijun_f,
-                "rsi":      rsi_f,
+                "symbol":    symbol,
+                "decision":  decision,
+                "prev":      prev_decision,
+                "score":     total,
+                "reasons":   reasons,
+                "close":     float(close),
+                "rsi_zone":  rsi_zone,
+                "date":      dt_str,
+                "kijun":     kijun_f,
+                "cloud_top": cloud_top_f,
+                "rsi":       rsi_f,
+                "signal_id": signal_id,
             })
 
     ch_insert("signals.strategy_1h",
-              ["symbol", "datetime", "decision", "score", "reasons", "prev_decision"],
+              ["symbol", "datetime", "decision", "score", "reasons", "prev_decision", "signal_id"],
               strategy_rows)
 
     if alert:
         for row in strategy_rows:
-            sym, dt, dec, score, rsns, _ = row
+            sym, dt, dec, score, rsns, _, _sid = row
             log.info("  %-8s  %-5s  score=%+d  %s  [%s ET]",
                      sym, dec, score, " | ".join(rsns[:3]), dt[11:16])
         log.info("strategy_1h: wrote %d rows", len(strategy_rows))

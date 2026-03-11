@@ -265,7 +265,8 @@ def compute_for_symbol(symbol: str, yf_ticker: str | None = None,
     start = fetch_from
 
     try:
-        df = yf.download(yf_ticker, start=str(start), end=str(end),
+        # yfinance `end` is exclusive — add 1 day so we include end_date's bar
+        df = yf.download(yf_ticker, start=str(start), end=str(end + timedelta(days=1)),
                          progress=False, auto_adjust=True)
     except Exception as e:
         print(f"  ERR   {symbol}: yfinance download failed — {e}", file=sys.stderr)
@@ -533,7 +534,6 @@ def compute_for_symbol_1h(symbol: str, yf_ticker: str | None = None) -> list[dic
         }
         score, _ = score_signal(pd.Series(current), pd.Series(prev_row) if prev_row else None)
 
-        r_div       = str(div.iloc[i])
         total_score = score
         if total_score >= 4:
             signal = "bullish"
